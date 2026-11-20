@@ -1512,7 +1512,10 @@ func main() {
 				updates["pain"] = brainResp.Bant.Pain
 			}
 			if brainResp.Bant.Name != "" && brainResp.Bant.Name != "Usuario desconocido" {
-				updates["name"] = brainResp.Bant.Name
+				if !strings.EqualFold(strings.TrimSpace(brainResp.Bant.Name), strings.TrimSpace(config.AgentName)) &&
+					!strings.EqualFold(strings.TrimSpace(brainResp.Bant.Name), strings.TrimSpace(config.Name)) {
+					updates["name"] = brainResp.Bant.Name
+				}
 			}
 			DB.Model(&lead).Updates(updates)
 
