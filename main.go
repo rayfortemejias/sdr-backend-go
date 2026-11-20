@@ -1882,31 +1882,64 @@ func main() {
 		}
 
 		cleanKamName := strings.TrimSpace(req.Name)
-		hashed, _ := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
-		user := User{
-			Email:            req.Email,
-			Name:             cleanKamName,
-			Password:         string(hashed),
-			Role:             "EXECUTIVE",
-			CompanyID:        req.CompanyID,
-			CompanyConfirmed: true,
-		}
-		if err := DB.Create(&user).Error; err != nil {
-			jsonErr(w, http.StatusInternalServerError, "Error al crear usuario")
+		cleanKamRole := strings.TrimSpace(req.Role)
+		cleanEmail := strings.ToLower(strings.TrimSpace(req.Email))
+		cleanPhone := strings.TrimSpace(req.Phone)
+
+		if cleanKamName == "" || cleanKamRole == "" || cleanEmail == "" || cleanPhone == "" {
+			jsonErr(w, http.StatusBadRequest, "Todos los campos (nombre, rol, teléfono y correo) son obligatorios")
 			return
+		}
+
+		var existingKam KAM
+		if err := DB.Where("company_id = ? AND lower(email) = ? AND active = true", req.CompanyID, cleanEmail).First(&existingKam).Error; err == nil {
+			jsonErr(w, http.StatusConflict, "Ya existe un ejecutivo activo registrado con ese correo")
+			return
+		}
+
+		var user User
+		inviteStatus := "PENDING"
+		if err := DB.Where("lower(email) = ?", cleanEmail).First(&user).Error; err == nil {
+			// El usuario ya existe (ej. el Administrador usando "AGREGARME A MÍ MISMO")
+			if user.CompanyID != "" && user.CompanyID != "default_company" && user.CompanyID != req.CompanyID {
+				jsonErr(w, http.StatusConflict, "Este correo ya está registrado en otra empresa")
+				return
+			}
+			// Mantener su rol actual (ej. ADMIN) sin degradarlo ni duplicar el registro
+			if user.Role == "ADMIN" {
+				inviteStatus = "REDEEMED"
+			}
+		} else {
+			if strings.TrimSpace(req.Password) == "" {
+				jsonErr(w, http.StatusBadRequest, "La contraseña es obligatoria para nuevos ejecutivos")
+				return
+			}
+			hashed, _ := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+			user = User{
+				Email:            cleanEmail,
+				Name:             cleanKamName,
+				Password:         string(hashed),
+				Role:             "EXECUTIVE",
+				CompanyID:        req.CompanyID,
+				CompanyConfirmed: true,
+			}
+			if err := DB.Create(&user).Error; err != nil {
+				jsonErr(w, http.StatusInternalServerError, "Error al crear usuario")
+				return
+			}
 		}
 
 		inviteCode := generateInviteCode()
 		kam := KAM{
 			CompanyID:    req.CompanyID,
 			Name:         cleanKamName,
-			Role:         req.Role,
-			Phone:        req.Phone,
-			Email:        req.Email,
+			Role:         cleanKamRole,
+			Phone:        cleanPhone,
+			Email:        cleanEmail,
 			Active:       true,
 			UserID:       user.ID,
 			InviteCode:   inviteCode,
-			InviteStatus: "PENDING",
+			InviteStatus: inviteStatus,
 		}
 		if err := DB.Create(&kam).Error; err != nil {
 			jsonErr(w, http.StatusInternalServerError, "Error al crear perfil KAM")
