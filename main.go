@@ -1214,6 +1214,12 @@ func main() {
 			"assigned_kam": kamCleanName,
 		})
 
+		// Sincronizar correo del KAM como invitado en Google Calendar (asíncrono)
+		var kamRecord KAM
+		if err := DB.Where("company_id = ? AND (LOWER(TRIM(name)) = LOWER(?) OR phone = ?)", companyID, kamCleanName, req.KamPhone).First(&kamRecord).Error; err == nil && strings.TrimSpace(kamRecord.Email) != "" {
+			go syncKamToGoogleCalendar(companyID, kamRecord.Email, lead.Name, lead.Phone)
+		}
+
 		jsonOK(w, map[string]interface{}{
 			"lead":    lead,
 			"message": "Handoff realizado. KAM y Lead notificados por WhatsApp.",
@@ -2014,6 +2020,123 @@ func main() {
 		jsonOK(w, msg)
 	}))
 
+	// ── No-Show (Reapertura para que la IA reagende) ──────────────────────────
+	mux.HandleFunc("/api/leads/no-show", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			jsonErr(w, http.StatusMethodNotAllowed, "método no permitido")
+			return
+		}
+		var req struct {
+			LeadID      uint   `json:"lead_id"`
+			CompanyID   string `json:"company_id"`
+			ReopenForAI bool   `json:"reopen_for_ai"`
+			Feedback    string `json:"feedback"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			jsonErr(w, http.StatusBadRequest, "payload inválido")
+			return
+		}
+		companyID := req.CompanyID
+		if companyID == "" {
+			companyID = getCompanyID(r)
+		}
+		var lead Lead
+		if err := DB.Where("id = ? AND company_id = ?", req.LeadID, companyID).First(&lead).Error; err != nil {
+			jsonErr(w, http.StatusNotFound, "lead no encontrado")
+			return
+		}
+
+		nextStatus := "EN_SEGUIMIENTO"
+		if req.ReopenForAI {
+			nextStatus = "EN_CALIFICACION"
+		}
+
+		enrichedMap := map[string]interface{}{}
+		if strings.TrimSpace(lead.EnrichedData) != "" {
+			_ = json.Unmarshal([]byte(lead.EnrichedData), &enrichedMap)
+		}
+		enrichedMap["last_meeting_outcome"] = "NO_SHOW"
+		if strings.TrimSpace(req.Feedback) != "" {
+			enrichedMap["no_show_feedback"] = strings.TrimSpace(req.Feedback)
+		}
+		if req.ReopenForAI {
+			enrichedMap["next_step"] = "Reagendar videollamada con la IA tras No-Show."
+		} else {
+			enrichedMap["next_step"] = "Seguimiento manual tras No-Show."
+		}
+		enrichedBytes, _ := json.Marshal(enrichedMap)
+
+		DB.Model(&lead).Updates(map[string]interface{}{
+			"status":        nextStatus,
+			"enriched_data": string(enrichedBytes),
+		})
+
+		whatsappSent := false
+		if req.ReopenForAI && strings.TrimSpace(lead.Phone) != "" {
+			greetingName := ""
+			lowerName := strings.ToLower(strings.TrimSpace(lead.Name))
+			if lowerName != "" && lowerName != "usuario desconocido" && lowerName != "unknown" {
+				greetingName = " " + strings.TrimSpace(lead.Name)
+			}
+			rebookMsg := fmt.Sprintf("Hola%s 👋 Notamos que no pudimos coincidir en nuestra reunión agendada. No te preocupes, ¿te gustaría que coordinemos un nuevo día y horario que te acomode mejor?", greetingName)
+			if err := sendWhatsAppMessage(lead.Phone, rebookMsg, "sdr-"+companyID); err != nil {
+				log.Printf("⚠️ [No-Show] Error enviando WhatsApp de reagendamiento a %s: %v", lead.Phone, err)
+			} else {
+				whatsappSent = true
+				DB.Create(&Conversation{
+					LeadID:    lead.ID,
+					CompanyID: companyID,
+					Role:      "assistant",
+					Content:   rebookMsg,
+				})
+			}
+		}
+
+		jsonOK(w, map[string]interface{}{
+			"lead_id":       lead.ID,
+			"status":        nextStatus,
+			"whatsapp_sent": whatsappSent,
+		})
+	}))
+
+	// ── Sincronizar KAM en Google Calendar ────────────────────────────────────
+	mux.HandleFunc("/api/leads/sync-meeting-calendar", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			jsonErr(w, http.StatusMethodNotAllowed, "método no permitido")
+			return
+		}
+		var req struct {
+			LeadID    uint   `json:"lead_id"`
+			CompanyID string `json:"company_id"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			jsonErr(w, http.StatusBadRequest, "payload inválido")
+			return
+		}
+		companyID := req.CompanyID
+		if companyID == "" {
+			companyID = getCompanyID(r)
+		}
+		var lead Lead
+		if err := DB.Where("id = ? AND company_id = ?", req.LeadID, companyID).First(&lead).Error; err != nil {
+			jsonErr(w, http.StatusNotFound, "lead no encontrado")
+			return
+		}
+		if strings.TrimSpace(lead.AssignedKam) == "" {
+			jsonErr(w, http.StatusBadRequest, "el lead no tiene un ejecutivo asignado")
+			return
+		}
+		var kam KAM
+		if err := DB.Where("company_id = ? AND LOWER(TRIM(name)) = LOWER(?)", companyID, strings.TrimSpace(lead.AssignedKam)).First(&kam).Error; err != nil || strings.TrimSpace(kam.Email) == "" {
+			jsonErr(w, http.StatusNotFound, "no se encontró correo para el ejecutivo asignado")
+			return
+		}
+		result := syncKamToGoogleCalendar(companyID, kam.Email, lead.Name, lead.Phone)
+		jsonOK(w, result)
+	}))
+
+	// Iniciar worker de recordatorios automáticos pre-reunión (~1h antes)
+	go startMeetingReminderWorker()
 
 	fmt.Printf("✅ SDR Backend Go v2.0 iniciado en puerto %s\n", port)
 	if err := http.ListenAndServe("0.0.0.0:"+port, mux); err != nil {
@@ -2310,6 +2433,10 @@ func autoAssignLeadToKAM(lead *Lead, companyID string, brief string, action stri
 		"assigned_kam": bestKamName,
 	})
 
+	if strings.TrimSpace(bestKam.Email) != "" {
+		go syncKamToGoogleCalendar(companyID, bestKam.Email, lead.Name, lead.Phone)
+	}
+
 	return true, bestKamName
 }
 
@@ -2336,5 +2463,192 @@ func autoAssignPendingLeads(companyID string) int {
 		}
 	}
 	return countAssigned
+}
+
+// ─── Sincronización KAM en Google Calendar & Recordatorios Pre-Reunión ───────
+
+var sentMeetingReminders sync.Map
+
+func getAdminGoogleTokens(companyID string) (string, string) {
+	var adminUser User
+	if err := DB.Where("company_id = ? AND role = 'ADMIN' AND google_access_token != ''", companyID).First(&adminUser).Error; err == nil {
+		return adminUser.GoogleAccessToken, adminUser.GoogleRefreshToken
+	}
+	if err := DB.Where("REPLACE(REPLACE(email, '@', '-'), '.', '-') = ? AND google_access_token != ''", companyID).First(&adminUser).Error; err == nil {
+		return adminUser.GoogleAccessToken, adminUser.GoogleRefreshToken
+	}
+	return "", ""
+}
+
+func syncKamToGoogleCalendar(companyID, kamEmail, leadName, leadPhone string) map[string]interface{} {
+	accessToken, refreshToken := getAdminGoogleTokens(companyID)
+	if accessToken == "" || strings.TrimSpace(kamEmail) == "" {
+		return map[string]interface{}{"synced": false, "message": "Google Calendar no conectado o KAM sin correo"}
+	}
+	brainURL := os.Getenv("BRAIN_API_URL")
+	if brainURL == "" {
+		brainURL = "https://sdr-brain-python.onrender.com"
+	}
+	payload := map[string]interface{}{
+		"access_token":  accessToken,
+		"refresh_token": refreshToken,
+		"kam_email":     strings.TrimSpace(kamEmail),
+		"lead_name":     leadName,
+		"lead_phone":    leadPhone,
+	}
+	bodyBytes, _ := json.Marshal(payload)
+	client := &http.Client{Timeout: 20 * time.Second}
+	resp, err := client.Post(brainURL+"/calendar/sync-kam", "application/json", bytes.NewBuffer(bodyBytes))
+	if err != nil {
+		log.Printf("⚠️ [Calendar Sync KAM] Error llamando a brain: %v", err)
+		return map[string]interface{}{"synced": false, "message": err.Error()}
+	}
+	defer resp.Body.Close()
+	respBytes, _ := io.ReadAll(resp.Body)
+	var out map[string]interface{}
+	if err := json.Unmarshal(respBytes, &out); err != nil {
+		return map[string]interface{}{"synced": false, "message": "respuesta inválida"}
+	}
+	log.Printf("📅 [Calendar Sync KAM] company=%s kam=%s result=%v", companyID, kamEmail, out["message"])
+	return out
+}
+
+func startMeetingReminderWorker() {
+	ticker := time.NewTicker(10 * time.Minute)
+	defer ticker.Stop()
+	// Espera inicial breve para no sobrecargar el arranque
+	time.Sleep(45 * time.Second)
+	for {
+		runMeetingReminderCheck()
+		<-ticker.C
+	}
+}
+
+func runMeetingReminderCheck() {
+	var admins []User
+	if err := DB.Where("role = 'ADMIN' AND google_access_token != ''").Find(&admins).Error; err != nil || len(admins) == 0 {
+		return
+	}
+	brainURL := os.Getenv("BRAIN_API_URL")
+	if brainURL == "" {
+		brainURL = "https://sdr-brain-python.onrender.com"
+	}
+	client := &http.Client{Timeout: 20 * time.Second}
+
+	for _, admin := range admins {
+		companyID := admin.CompanyID
+		if companyID == "" || companyID == "default_company" {
+			companyID = strings.ReplaceAll(strings.ReplaceAll(admin.Email, "@", "-"), ".", "-")
+		}
+		payload := map[string]interface{}{
+			"access_token":  admin.GoogleAccessToken,
+			"refresh_token": admin.GoogleRefreshToken,
+			"min_minutes":   45,
+			"max_minutes":   75,
+		}
+		bodyBytes, _ := json.Marshal(payload)
+		resp, err := client.Post(brainURL+"/calendar/upcoming-meetings", "application/json", bytes.NewBuffer(bodyBytes))
+		if err != nil {
+			continue
+		}
+		var data struct {
+			Meetings []struct {
+				EventID     string   `json:"event_id"`
+				Summary     string   `json:"summary"`
+				Description string   `json:"description"`
+				StartTime   string   `json:"start_time"`
+				MeetLink    string   `json:"meet_link"`
+				Attendees   []string `json:"attendees"`
+			} `json:"meetings"`
+		}
+		respBytes, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err := json.Unmarshal(respBytes, &data); err != nil || len(data.Meetings) == 0 {
+			continue
+		}
+
+		var leads []Lead
+		DB.Where("company_id = ? AND status IN ('HANDOFF', 'POR_AGENDAR')", companyID).Find(&leads)
+
+		for _, mtg := range data.Meetings {
+			if mtg.EventID == "" {
+				continue
+			}
+			reminderKey := companyID + "::" + mtg.EventID
+			if _, alreadySent := sentMeetingReminders.Load(reminderKey); alreadySent {
+				continue
+			}
+
+			blob := strings.ToLower(mtg.Summary + " " + mtg.Description)
+			blobDigits := strings.Map(func(r rune) rune {
+				if r >= '0' && r <= '9' {
+					return r
+				}
+				return -1
+			}, blob)
+
+			var matchedLead *Lead
+			for i := range leads {
+				l := &leads[i]
+				lDigits := strings.Map(func(r rune) rune {
+					if r >= '0' && r <= '9' {
+						return r
+					}
+					return -1
+				}, l.Phone)
+				shortPhone := lDigits
+				if len(shortPhone) > 8 {
+					shortPhone = shortPhone[len(shortPhone)-8:]
+				}
+				lName := strings.ToLower(strings.TrimSpace(l.Name))
+				if (shortPhone != "" && strings.Contains(blobDigits, shortPhone)) ||
+					(lName != "" && lName != "usuario desconocido" && strings.Contains(blob, lName)) {
+					matchedLead = l
+					break
+				}
+			}
+
+			if matchedLead == nil {
+				continue
+			}
+
+			// Formatear hora legible HH:MM
+			displayTime := mtg.StartTime
+			if t, err := time.Parse(time.RFC3339, mtg.StartTime); err == nil {
+				displayTime = t.Format("15:04") + " hrs"
+			}
+
+			meetLine := ""
+			if mtg.MeetLink != "" {
+				meetLine = fmt.Sprintf("\n🔗 Enlace de videollamada: %s", mtg.MeetLink)
+			}
+
+			// Recordatorio al Lead
+			if matchedLead.Phone != "" {
+				kamLabel := "nuestro especialista"
+				if strings.TrimSpace(matchedLead.AssignedKam) != "" {
+					kamLabel = strings.TrimSpace(matchedLead.AssignedKam)
+				}
+				leadMsg := fmt.Sprintf("⏰ *Recordatorio de reunión*\n\nTu videollamada con *%s* comienza en aproximadamente 1 hora (%s).%s\n\nSi necesitas reprogramar el horario, avísanos por este chat.", kamLabel, displayTime, meetLine)
+				if err := sendWhatsAppMessage(matchedLead.Phone, leadMsg, "sdr-"+companyID); err != nil {
+					log.Printf("⚠️ [Reminder] Error enviando recordatorio al lead %s: %v", matchedLead.Phone, err)
+				}
+			}
+
+			// Recordatorio al KAM asignado
+			if strings.TrimSpace(matchedLead.AssignedKam) != "" {
+				var kam KAM
+				if err := DB.Where("company_id = ? AND LOWER(TRIM(name)) = LOWER(?)", companyID, strings.TrimSpace(matchedLead.AssignedKam)).First(&kam).Error; err == nil && kam.Phone != "" {
+					kamMsg := fmt.Sprintf("⏰ *Recordatorio de reunión (en ~1 hora)*\n\n👤 *Lead:* %s (%s)\n🕒 *Hora:* %s%s", matchedLead.Name, matchedLead.Phone, displayTime, meetLine)
+					if err := sendWhatsAppMessage(kam.Phone, kamMsg, "sdr-"+companyID); err != nil {
+						log.Printf("⚠️ [Reminder] Error enviando recordatorio al KAM %s: %v", kam.Phone, err)
+					}
+				}
+			}
+
+			sentMeetingReminders.Store(reminderKey, time.Now())
+			log.Printf("✅ [Reminder] Recordatorio pre-reunión enviado para evento %s (Lead #%d)", mtg.EventID, matchedLead.ID)
+		}
+	}
 }
 
