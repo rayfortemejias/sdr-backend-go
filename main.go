@@ -2088,15 +2088,29 @@ func main() {
 			DB.Model(&lead).Update("status", "HANDOFF")
 		}
 
+		targetCompanyID := strings.TrimSpace(lead.CompanyID)
+		if targetCompanyID == "" {
+			targetCompanyID = strings.TrimSpace(req.CompanyID)
+		}
+
 		msg := Conversation{
 			LeadID:    lead.ID,
-			CompanyID: req.CompanyID,
+			CompanyID: targetCompanyID,
 			Role:      "assistant",
 			Content:   req.Message,
 		}
 		DB.Create(&msg)
 
-		sendWhatsAppMessage(lead.Phone, req.Message, req.CompanyID)
+		instanceName := targetCompanyID
+		if !strings.HasPrefix(instanceName, "sdr-") {
+			instanceName = "sdr-" + instanceName
+		}
+		if err := sendWhatsAppMessage(lead.Phone, req.Message, instanceName); err != nil {
+			log.Printf("❌ [Inbox /api/chat/send] Error enviando WhatsApp a %s (instancia %s): %v", lead.Phone, instanceName, err)
+			jsonErr(w, http.StatusBadGateway, fmt.Sprintf("Mensaje guardado en Inbox, pero falló el envío por WhatsApp: %v", err))
+			return
+		}
+		log.Printf("✅ [Inbox /api/chat/send] Mensaje humano enviado a %s vía %s", lead.Phone, instanceName)
 
 		jsonOK(w, msg)
 	}))
