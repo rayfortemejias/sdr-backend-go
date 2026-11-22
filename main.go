@@ -970,6 +970,7 @@ func main() {
 	}))
 
 	mux.HandleFunc("/api/kams/update", corsMiddleware(handleKamUpdate))
+	mux.HandleFunc("/api/kams/delete", corsMiddleware(handleKamDelete))
 
 	// ── Canjear Código de Invitación (KAM / Ejecutivo) ───────────────────────
 	mux.HandleFunc("/api/kams/redeem-code", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
@@ -2247,6 +2248,7 @@ func handleKamUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	oldName := kam.Name
 	updates := map[string]interface{}{}
 	if req.Name != "" {
 		kam.Name = strings.TrimSpace(req.Name)
@@ -2280,6 +2282,11 @@ func handleKamUpdate(w http.ResponseWriter, r *http.Request) {
 
 	DB.Model(&kam).Updates(updates)
 
+	// Si cambió el nombre del ejecutivo, sincronizar los leads ya asignados a él
+	if strings.TrimSpace(oldName) != "" && strings.TrimSpace(kam.Name) != "" && !strings.EqualFold(strings.TrimSpace(oldName), strings.TrimSpace(kam.Name)) {
+		DB.Model(&Lead{}).Where("company_id = ? AND LOWER(TRIM(assigned_kam)) = LOWER(?)", kam.CompanyID, strings.TrimSpace(oldName)).Update("assigned_kam", kam.Name)
+	}
+
 	if kam.UserID != 0 {
 		userUpdates := map[string]interface{}{}
 		if kam.Name != "" {
@@ -2307,6 +2314,88 @@ func handleKamUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	jsonOK(w, kam)
+}
+
+// handleKamDelete elimina un KAM, desasigna sus leads activos y notifica por WhatsApp
+func handleKamDelete(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "DELETE" && r.Method != "POST" {
+		jsonErr(w, http.StatusMethodNotAllowed, "método no permitido")
+		return
+	}
+	companyID := getCompanyID(r)
+	var req struct {
+		ID        uint   `json:"id"`
+		CompanyID string `json:"company_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonErr(w, http.StatusBadRequest, "payload inválido")
+		return
+	}
+	if req.ID == 0 {
+		jsonErr(w, http.StatusBadRequest, "id requerido")
+		return
+	}
+	if req.CompanyID != "" {
+		companyID = req.CompanyID
+	}
+
+	var kam KAM
+	query := DB.Where("id = ?", req.ID)
+	if companyID != "" {
+		query = query.Where("company_id = ?", companyID)
+	}
+	if err := query.First(&kam).Error; err != nil {
+		jsonErr(w, http.StatusNotFound, "ejecutivo no encontrado")
+		return
+	}
+
+	kamCleanName := strings.TrimSpace(kam.Name)
+	var unassignedLeads int64
+	if kamCleanName != "" {
+		// Leads en HANDOFF vuelven a POR_AGENDAR sin KAM para que se reasignen fácilmente
+		resHandoff := DB.Model(&Lead{}).
+			Where("company_id = ? AND LOWER(TRIM(assigned_kam)) = LOWER(?) AND status = 'HANDOFF'", kam.CompanyID, kamCleanName).
+			Updates(map[string]interface{}{"assigned_kam": "", "status": "POR_AGENDAR"})
+		unassignedLeads += resHandoff.RowsAffected
+
+		// Resto de leads con este KAM solo limpian assigned_kam
+		resOther := DB.Model(&Lead{}).
+			Where("company_id = ? AND LOWER(TRIM(assigned_kam)) = LOWER(?)", kam.CompanyID, kamCleanName).
+			Update("assigned_kam", "")
+		unassignedLeads += resOther.RowsAffected
+	}
+
+	// Eliminar el registro KAM
+	if err := DB.Unscoped().Delete(&kam).Error; err != nil {
+		jsonErr(w, http.StatusInternalServerError, "Error al eliminar ejecutivo")
+		return
+	}
+
+	// Eliminar usuario asociado SOLO si no es ADMIN
+	if kam.UserID != 0 {
+		var u User
+		if err := DB.First(&u, kam.UserID).Error; err == nil && u.Role != "ADMIN" {
+			DB.Unscoped().Delete(&u)
+		}
+	}
+
+	companyName := kam.CompanyID
+	var cfg CompanyConfig
+	if err := DB.Where("company_id = ?", kam.CompanyID).First(&cfg).Error; err == nil && cfg.Name != "" {
+		companyName = cfg.Name
+	}
+
+	if kam.Phone != "" {
+		msg := fmt.Sprintf("ℹ️ *Nodepath Command Center — Acceso de Ejecutivo Revocado*\n\nHola %s, te informamos que tu perfil de Ejecutivo Comercial en *%s* ha sido dado de baja por el administrador.\n\nSi crees que se trata de un error, contáctate con tu administrador.", kam.Name, companyName)
+		sendWhatsAppMessage(kam.Phone, msg, "sdr-"+kam.CompanyID)
+	}
+
+	jsonOK(w, map[string]interface{}{
+		"deleted_id":       kam.ID,
+		"kam_name":         kam.Name,
+		"unassigned_leads": unassignedLeads,
+		"message":          "Ejecutivo eliminado correctamente",
+	})
 }
 
 // ─── DB Init ─────────────────────────────────────────────────────────────────
