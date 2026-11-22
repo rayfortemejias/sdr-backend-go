@@ -953,7 +953,7 @@ func main() {
 			}
 
 			if kam.Phone != "" {
-				inviteMsg := fmt.Sprintf("🔑 *Nodepath Command Center — Invitación a Equipo*\n\nHola %s, has sido registrado como Ejecutivo Comercial en %s.\n\nIngresa con tu correo en https://os.getnodepath.com para acceder a tu bandeja compartida de leads.\n\n(Tu código de referencia de equipo es: *%s*)", kam.Name, companyName, kam.InviteCode)
+				inviteMsg := fmt.Sprintf("🔑 *Nodepath Dashboard — Invitación a Equipo*\n\nHola %s, has sido registrado como Ejecutivo Comercial en %s.\n\nIngresa con tu correo en https://os.getnodepath.com para acceder a tu bandeja compartida de leads.\n\n(Tu código de referencia de equipo es: *%s*)", kam.Name, companyName, kam.InviteCode)
 				sendWhatsAppMessage(kam.Phone, inviteMsg, "sdr-"+companyID)
 			}
 			if kam.Email != "" {
@@ -1098,7 +1098,7 @@ func main() {
 		}
 
 		if kam.Phone != "" {
-			inviteMsg := fmt.Sprintf("🔑 *Nodepath Command Center — Código de Invitación Actualizado*\n\nHola %s, tu administrador ha renovado tu código de invitación para unirte como Ejecutivo Comercial a %s.\n\nTu nuevo código es:\n👉 *%s*\n\nIngresa en https://os.getnodepath.com e introduce este código para acceder a tu bandeja de leads.", kam.Name, companyName, newCode)
+			inviteMsg := fmt.Sprintf("🔑 *Nodepath Dashboard — Código de Invitación Actualizado*\n\nHola %s, tu administrador ha renovado tu código de invitación para unirte como Ejecutivo Comercial a %s.\n\nTu nuevo código es:\n👉 *%s*\n\nIngresa en https://os.getnodepath.com e introduce este código para acceder a tu bandeja de leads.", kam.Name, companyName, newCode)
 			sendWhatsAppMessage(kam.Phone, inviteMsg, "sdr-"+kam.CompanyID)
 		}
 
@@ -2040,7 +2040,7 @@ func main() {
 		}
 
 		if kam.Phone != "" {
-			inviteMsg := fmt.Sprintf("🔑 *Nodepath Command Center — Invitación a Equipo*\n\nHola %s, has sido registrado como Ejecutivo Comercial en %s.\n\nIngresa con tu correo en https://os.getnodepath.com para acceder a tu bandeja de leads asignados.\n\n(Tu código de referencia de equipo es: *%s*)", kam.Name, companyName, kam.InviteCode)
+			inviteMsg := fmt.Sprintf("🔑 *Nodepath Dashboard — Invitación a Equipo*\n\nHola %s, has sido registrado como Ejecutivo Comercial en %s.\n\nIngresa con tu correo en https://os.getnodepath.com para acceder a tu bandeja de leads asignados.\n\n(Tu código de referencia de equipo es: *%s*)", kam.Name, companyName, kam.InviteCode)
 			sendWhatsAppMessage(kam.Phone, inviteMsg, "sdr-"+kam.CompanyID)
 		}
 
@@ -2274,13 +2274,13 @@ func sendKamNotificationEmail(toEmail, kamName, kamRole, companyName, inviteCode
 		subject := fmt.Sprintf("%s — %s", actionTitle, companyName)
 		loginUrl := "https://os.getnodepath.com"
 
-		body := fmt.Sprintf("From: Nodepath Command Center <%s>\r\n"+
+		body := fmt.Sprintf("From: Nodepath Dashboard <%s>\r\n"+
 			"To: %s\r\n"+
 			"Subject: %s\r\n"+
 			"MIME-Version: 1.0\r\n"+
 			"Content-Type: text/html; charset=UTF-8\r\n\r\n"+
 			"<div style=\"font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; background-color: #0b141a; color: #fff; padding: 30px; border-radius: 12px; border: 1px solid rgba(0,251,255,0.3);\">"+
-			"<h2 style=\"color: #00fbff; margin-top: 0;\">Nodepath Command Center</h2>"+
+			"<h2 style=\"color: #00fbff; margin-top: 0;\">Nodepath Dashboard</h2>"+
 			"<h3 style=\"color: #fff;\">%s</h3>"+
 			"<p style=\"color: #ccc;\">Hola <strong>%s</strong>,</p>"+
 			"<p style=\"color: #ccc;\">%s</p>"+
@@ -2399,7 +2399,7 @@ func handleKamUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if kam.Phone != "" {
-		msg := fmt.Sprintf("👤 *Nodepath Command Center — Perfil de Ejecutivo Actualizado*\n\nHola %s, tu perfil de Ejecutivo Comercial en %s ha sido actualizado.\n\nRol: %s\nEmail: %s\nCódigo de Referencia: *%s*\n\nAccede en https://os.getnodepath.com", kam.Name, companyName, kam.Role, kam.Email, kam.InviteCode)
+		msg := fmt.Sprintf("👤 *Nodepath Dashboard — Perfil de Ejecutivo Actualizado*\n\nHola %s, tu perfil de Ejecutivo Comercial en %s ha sido actualizado.\n\nRol: %s\nEmail: %s\nCódigo de Referencia: *%s*\n\nAccede en https://os.getnodepath.com", kam.Name, companyName, kam.Role, kam.Email, kam.InviteCode)
 		sendWhatsAppMessage(kam.Phone, msg, "sdr-"+kam.CompanyID)
 	}
 
@@ -2480,7 +2480,7 @@ func handleKamDelete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if kam.Phone != "" {
-		msg := fmt.Sprintf("ℹ️ *Nodepath Command Center — Acceso de Ejecutivo Revocado*\n\nHola %s, te informamos que tu perfil de Ejecutivo Comercial en *%s* ha sido dado de baja por el administrador.\n\nSi crees que se trata de un error, contáctate con tu administrador.", kam.Name, companyName)
+		msg := fmt.Sprintf("ℹ️ *Nodepath Dashboard — Acceso de Ejecutivo Revocado*\n\nHola %s, te informamos que tu perfil de Ejecutivo Comercial en *%s* ha sido dado de baja por el administrador.\n\nSi crees que se trata de un error, contáctate con tu administrador.", kam.Name, companyName)
 		sendWhatsAppMessage(kam.Phone, msg, "sdr-"+kam.CompanyID)
 	}
 
