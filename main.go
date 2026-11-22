@@ -1487,6 +1487,86 @@ func main() {
 				return
 			}
 
+			// Recargar estado fresco del lead para detectar si ya estaba en HANDOFF
+			var freshLeadBeforeUpdate Lead
+			wasHandoff := lead.Status == "HANDOFF"
+			if err := DB.First(&freshLeadBeforeUpdate, lead.ID).Error; err == nil {
+				if freshLeadBeforeUpdate.Status == "HANDOFF" {
+					wasHandoff = true
+				}
+				if freshLeadBeforeUpdate.AssignedKam != "" {
+					lead.AssignedKam = freshLeadBeforeUpdate.AssignedKam
+				}
+			}
+
+			// Modo Concierge (Lead en HANDOFF): NO degradar estado ni guardar respuesta vacía;
+			// acusar recibo al lead (con cooldown) y alertar de inmediato al KAM por WhatsApp.
+			if wasHandoff || brainResp.Response == "" {
+				log.Printf("🤝 Modo Concierge (HANDOFF) activo para lead #%d (%s)", lead.ID, phone)
+
+				kamDisplay := strings.TrimSpace(lead.AssignedKam)
+				if kamDisplay == "" {
+					kamDisplay = "tu ejecutivo comercial"
+				}
+				var assignedKamRecord KAM
+				hasKamRecord := false
+				if strings.TrimSpace(lead.AssignedKam) != "" {
+					if err := DB.Where("company_id = ? AND LOWER(TRIM(name)) = LOWER(?)", companyID, strings.TrimSpace(lead.AssignedKam)).First(&assignedKamRecord).Error; err == nil {
+						hasKamRecord = true
+					}
+				}
+
+				// 1. Alertar de inmediato al KAM por WhatsApp con el mensaje exacto del lead
+				if hasKamRecord && strings.TrimSpace(assignedKamRecord.Phone) != "" {
+					leadPhoneDigits := strings.Map(func(r rune) rune {
+						if r >= '0' && r <= '9' {
+							return r
+						}
+						return -1
+					}, phone)
+					kamAlert := fmt.Sprintf("💬 *Nuevo mensaje de tu lead (%s)*\n\n\"%s\"\n\n📥 *Responder en Inbox (guarda historial):* https://os.getnodepath.com/marketing/sdr\n📱 *WhatsApp directo del lead:* https://wa.me/%s", lead.Name, text, leadPhoneDigits)
+					if err := sendWhatsAppMessage(assignedKamRecord.Phone, kamAlert, payload.Instance); err != nil {
+						log.Printf("⚠️ [Modo Concierge] Error alertando al KAM %s: %v", assignedKamRecord.Phone, err)
+					} else {
+						log.Printf("✅ [Modo Concierge] Alerta enviada al KAM %s por nuevo mensaje del lead #%d", assignedKamRecord.Name, lead.ID)
+					}
+				}
+
+				// 2. Acuse de recibo humano al lead (cooldown 30 min para no spamear si manda varios mensajes seguidos)
+				shouldAck := true
+				if lastAckVal, ok := handoffAckCooldown.Load(lead.ID); ok {
+					if lastAckTime, okT := lastAckVal.(time.Time); okT && time.Since(lastAckTime) < 30*time.Minute {
+						shouldAck = false
+					}
+				}
+				if shouldAck {
+					ackMsg := fmt.Sprintf("¡Recibido! Ya le avisé a *%s* sobre tu mensaje para que te responda a la brevedad.", kamDisplay)
+					if hasKamRecord && strings.TrimSpace(assignedKamRecord.Phone) != "" {
+						kamPhoneDigits := strings.Map(func(r rune) rune {
+							if r >= '0' && r <= '9' {
+								return r
+							}
+							return -1
+						}, assignedKamRecord.Phone)
+						if kamPhoneDigits != "" {
+							ackMsg += fmt.Sprintf("\n\nSi prefieres escribirle directo a su WhatsApp, puedes hacerlo aquí: https://wa.me/%s", kamPhoneDigits)
+						}
+					}
+					if err := sendWhatsAppMessage(phone, ackMsg, payload.Instance); err != nil {
+						log.Printf("⚠️ [Modo Concierge] Error enviando acuse de recibo al lead %s: %v", phone, err)
+					} else {
+						handoffAckCooldown.Store(lead.ID, time.Now())
+						DB.Create(&Conversation{
+							LeadID:    lead.ID,
+							CompanyID: companyID,
+							Role:      "assistant",
+							Content:   ackMsg,
+						})
+					}
+				}
+				return
+			}
+
 			DB.Create(&Conversation{
 				LeadID:    lead.ID,
 				CompanyID: companyID,
@@ -2557,6 +2637,8 @@ func autoAssignPendingLeads(companyID string) int {
 // ─── Sincronización KAM en Google Calendar & Recordatorios Pre-Reunión ───────
 
 var sentMeetingReminders sync.Map
+var sentPostMeetingReminders sync.Map
+var handoffAckCooldown sync.Map
 
 func getAdminGoogleTokens(companyID string) (string, string) {
 	var adminUser User
@@ -2652,9 +2734,7 @@ func runMeetingReminderCheck() {
 		}
 		respBytes, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		if err := json.Unmarshal(respBytes, &data); err != nil || len(data.Meetings) == 0 {
-			continue
-		}
+		_ = json.Unmarshal(respBytes, &data)
 
 		var leads []Lead
 		DB.Where("company_id = ? AND status IN ('HANDOFF', 'POR_AGENDAR')", companyID).Find(&leads)
@@ -2737,6 +2817,83 @@ func runMeetingReminderCheck() {
 
 			sentMeetingReminders.Store(reminderKey, time.Now())
 			log.Printf("✅ [Reminder] Recordatorio pre-reunión enviado para evento %s (Lead #%d)", mtg.EventID, matchedLead.ID)
+		}
+
+		// ── Seguimiento Post-Reunión (30 a 90 min después de la hora de inicio) ──
+		postPayload := map[string]interface{}{
+			"access_token":  admin.GoogleAccessToken,
+			"refresh_token": admin.GoogleRefreshToken,
+			"min_minutes":   -90,
+			"max_minutes":   -30,
+		}
+		postBodyBytes, _ := json.Marshal(postPayload)
+		postResp, err := client.Post(brainURL+"/calendar/upcoming-meetings", "application/json", bytes.NewBuffer(postBodyBytes))
+		if err == nil {
+			var postData struct {
+				Meetings []struct {
+					EventID     string `json:"event_id"`
+					Summary     string `json:"summary"`
+					Description string `json:"description"`
+					StartTime   string `json:"start_time"`
+				} `json:"meetings"`
+			}
+			postRespBytes, _ := io.ReadAll(postResp.Body)
+			postResp.Body.Close()
+			if err := json.Unmarshal(postRespBytes, &postData); err == nil && len(postData.Meetings) > 0 {
+				for _, mtg := range postData.Meetings {
+					if mtg.EventID == "" {
+						continue
+					}
+					postKey := companyID + "::POST::" + mtg.EventID
+					if _, alreadySent := sentPostMeetingReminders.Load(postKey); alreadySent {
+						continue
+					}
+					blob := strings.ToLower(mtg.Summary + " " + mtg.Description)
+					blobDigits := strings.Map(func(r rune) rune {
+						if r >= '0' && r <= '9' {
+							return r
+						}
+						return -1
+					}, blob)
+
+					var matchedLead *Lead
+					for i := range leads {
+						l := &leads[i]
+						if l.Status != "HANDOFF" {
+							continue
+						}
+						lDigits := strings.Map(func(r rune) rune {
+							if r >= '0' && r <= '9' {
+								return r
+							}
+							return -1
+						}, l.Phone)
+						shortPhone := lDigits
+						if len(shortPhone) > 8 {
+							shortPhone = shortPhone[len(shortPhone)-8:]
+						}
+						lName := strings.ToLower(strings.TrimSpace(l.Name))
+						if (shortPhone != "" && strings.Contains(blobDigits, shortPhone)) ||
+							(lName != "" && lName != "usuario desconocido" && strings.Contains(blob, lName)) {
+							matchedLead = l
+							break
+						}
+					}
+					if matchedLead == nil || strings.TrimSpace(matchedLead.AssignedKam) == "" {
+						continue
+					}
+					var kam KAM
+					if err := DB.Where("company_id = ? AND LOWER(TRIM(name)) = LOWER(?)", companyID, strings.TrimSpace(matchedLead.AssignedKam)).First(&kam).Error; err == nil && kam.Phone != "" {
+						postMsg := fmt.Sprintf("📋 *Seguimiento Post-Reunión*\n\n¿Cómo te fue en la llamada con *%s* (%s)?\n\nRecuerda continuar atendiéndolo hasta cerrar y registrar el resultado (*Cerrado Ganado / Seguimiento / No-Show / Perdido*) desde tu INBOX:\n🔗 https://os.getnodepath.com/marketing/sdr", matchedLead.Name, matchedLead.Phone)
+						if err := sendWhatsAppMessage(kam.Phone, postMsg, "sdr-"+companyID); err != nil {
+							log.Printf("⚠️ [Post-Meeting Reminder] Error enviando seguimiento al KAM %s: %v", kam.Phone, err)
+						} else {
+							sentPostMeetingReminders.Store(postKey, time.Now())
+							log.Printf("✅ [Post-Meeting Reminder] Seguimiento post-reunión enviado al KAM %s (Lead #%d)", kam.Name, matchedLead.ID)
+						}
+					}
+				}
+			}
 		}
 	}
 }
